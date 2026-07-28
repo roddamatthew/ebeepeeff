@@ -28,20 +28,6 @@ struct {
     __type(value, __u32);
 } map_bytes_read SEC(".maps");
 
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 8192);
-    __type(key, __u64);
-    __type(value, __u64);
-} map_to_patch SEC(".maps");
-
-struct {
-    __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
-    __uint(max_entries, 5);
-    __type(key, __u32);
-    __type(value, __u32);
-} map_prog_array SEC(".maps");
-
 // Must always include a license
 char LICENSE[] SEC("license") = "GPL";
 
